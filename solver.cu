@@ -29,7 +29,7 @@ int POPULATION_SIZE = 200;
 int N_ITEMS = 10;
 int BLOCKSIZE = 256;
 int TOTALTHREADS = 1024;
-int N_DCCM = 256;
+int N_DCCM = 20;
 
 /* wrapper function to check cuda calls
  * ref: https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api
@@ -61,7 +61,7 @@ struct prg
         unsigned int operator()(const unsigned int n) const
         {
                 thrust::default_random_engine rng;
-                //thrust::default_random_engine rng( 5555555 );
+                // thrust::default_random_engine rng( 5555555 );
                 thrust::uniform_int_distribution<unsigned int> dist(a, b);
                 rng.discard(n);
 
@@ -131,26 +131,27 @@ int min_index(thrust::device_vector<T>& vec) {
  * array) is evaulated against the desired input function.  
  *
  * For current scenario, our Goal is to minimize shipments  
- * Cost Function: 1/(1+|uniqueDCCM|)
+ * Cost Function: 1/(1+|shipments|)
+ * where shipemts= total unique DCCM
  * Higher numbers represent better fitness.
  */
-__global__ void score(unsigned int n, unsigned int ni, double *source, double *score) {
+__global__ void score(unsigned int n, unsigned int ni, unsigned int *source, double *score, unsigned int *temp_solution) {
         int index = blockIdx.x * blockDim.x + threadIdx.x;
         int stride = blockDim.x * gridDim.x;
 
-        int value;
-
+        double value;
         if (index < n) {
                 for (int i=index; i < n; i += stride) {
-                        // score = 1/ (sqrt(sum((xi - 0.5)**2)) + 1)
                         value = 0;
                         for (int p=0; p<ni; p++) {
-                                value += (source[i*ni+p]);
+                                temp_solution[p] = source[i*ni+p];
                         }
-                        
-                        
-                        value = (double) std::sqrt( (double) value);
+                        thrust::sort(thrust::device, temp_solution, temp_solution+ni);
+                        unsigned int* end = thrust::unique(thrust::device, temp_solution, temp_solution+ni);
+                        int total_shiments = end - temp_solution;  
+                        value = (double)total_shiments  ;
                         score[i] = (double) 1.0 / (double) (value+1.0);
+                        
                 }
         }
 }
@@ -165,7 +166,7 @@ __global__ void score(unsigned int n, unsigned int ni, double *source, double *s
  * to bring the best members forward to the next generation.  Note many parents
  * can and will breed multiple times. 
  */
-__global__ void pickParents(unsigned int n, unsigned int np, int *randParents, double *score, int *pool) {
+__global__ void pickParents(unsigned int n, unsigned int np, unsigned int *randParents, double *score, unsigned int *pool) {
         int index = blockIdx.x * blockDim.x + threadIdx.x;
         int stride = blockDim.x * gridDim.x;
 
@@ -199,7 +200,7 @@ __global__ void pickParents(unsigned int n, unsigned int np, int *randParents, d
  * to create the child. In this event, 5% of the time a random mutation 
  * will also happen to the child's values.
  */
-__global__ void breedGeneration(unsigned int n, unsigned int np, int *randomParameters, double *population, double *newPopulation, int *parentsPool, double *mutations) {
+__global__ void breedGeneration(unsigned int n, unsigned int np, unsigned int *randomParameters, unsigned int *population, unsigned int *newPopulation, unsigned int *parentsPool, double *mutations) {
         int index = blockIdx.x * blockDim.x + threadIdx.x;
         int stride = blockDim.x * gridDim.x;
 
@@ -236,9 +237,8 @@ __global__ void breedGeneration(unsigned int n, unsigned int np, int *randomPara
                 }
 
                 if (probChildAMutate < 5) {
-                        double newval = newPopulation[(i*np) + mutationPoint] + mutations[i];
-                        newPopulation[(i*np) + mutationPoint] = fminf(newval, MAX);
-                        newPopulation[(i*np) + mutationPoint] = fmaxf(newval, MIN);
+                        double newval = mutations[i];
+                        newPopulation[(i*np) + mutationPoint] = newval;
                 }
 
         }
@@ -256,7 +256,7 @@ __global__ void init(unsigned int seed, curandState_t* states) {
 
 /* setRandom generates a random array modulo the max parameter.
  */
-__global__ void setRandom(curandState_t* states, int* numbers, int max) {
+__global__ void setRandom(curandState_t* states, unsigned int* numbers, int max) {
         int idx = threadIdx.x+blockDim.x*blockIdx.x;
 
         for (int i=0; i<SIZE_PARENT_POOL; i++) {
@@ -356,18 +356,21 @@ int main(int argc, char** argv) {
                           prg(0, N_DCCM));
 
         // Evaluate every member of the population and find the most fit individual
-        score<<<TOTALTHREADS, BLOCKSIZE>>>(POPULATION_SIZE, N_ITEMS, popPtr, scoresPtr);
+        thrust::device_vector<unsigned int> temp_solution(N_ITEMS);
+        unsigned int * tempSolutionPtr = thrust::raw_pointer_cast(&temp_solution[0]);
+        score<<<TOTALTHREADS, BLOCKSIZE>>>(POPULATION_SIZE, N_ITEMS, popPtr, scoresPtr, tempSolutionPtr);
         double best = *(thrust::max_element(popScores.begin(), popScores.end()));
         int best_index = min_index(popScores);
 
         std::cout << "Initial generation best score: " << best << " at index: " << best_index << "   ";
+        std::cout << "Solution:";
         for (int i=0; i<N_ITEMS; i++) {
                 std::cout << population[best_index * N_ITEMS + i] << " ";
         }
         std::cout << std::endl;
 
-        // Create successive generations until convergence is achieved.
-        while (best < .999) {
+        // // Create successive generations until convergence is achieved.
+        while (generation <20000) {
                 // Create a new set of random parents to breed into the next generation
                 init<<<POPULATION_SIZE*SIZE_PARENT_POOL, 1>>>(time(0), states);
                 gpuErrchk(cudaPeekAtLastError());
@@ -388,7 +391,7 @@ int main(int argc, char** argv) {
                 thrust::transform(index_sequence_begin,
                                   index_sequence_begin + POPULATION_SIZE,
                                   mutations.begin(),
-                                  normal(0.0, 0.001));
+                                  prg(0, N_DCCM));
                 double* mutPtr = thrust::raw_pointer_cast(&mutations[0]);
 
                 // Breed members and copy over to the new generation
@@ -397,12 +400,13 @@ int main(int argc, char** argv) {
                 thrust::copy(thrust::device, newPopulation.begin(), newPopulation.end(), population.begin());
 
                 // Evaluate all members and identify the most fit individual
-                score<<<TOTALTHREADS, BLOCKSIZE>>>(POPULATION_SIZE, N_ITEMS, popPtr, scoresPtr);
+                score<<<TOTALTHREADS, BLOCKSIZE>>>(POPULATION_SIZE, N_ITEMS, popPtr, scoresPtr, tempSolutionPtr);
                 gpuErrchk(cudaPeekAtLastError());
                 best = *(thrust::min_element(popScores.begin(), popScores.end()));
                 best_index = min_index(popScores);
 
                 std::cout << "Bred generation " << generation << " Best score: " << best << " at index: " << best_index << "   ";
+                std::cout << "Solution:";
                 for (int i=0; i<N_ITEMS; i++) {
                         std::cout << population[best_index * N_ITEMS + i] << " ";
                 }
@@ -411,7 +415,7 @@ int main(int argc, char** argv) {
                 // Keep track of how many generations have occured. 
                 generation++;
         }
-
+        
         cudaFree(states);
         cudaFree(randParents);
         cudaFree(parentsPool_d);
